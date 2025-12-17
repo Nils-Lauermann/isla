@@ -80,6 +80,30 @@ fn same_location<B: BV>(ev1: &AxEvent<B>, ev2: &AxEvent<B>) -> Sexp {
     }
 }
 
+fn same_page_offset<B: BV>(ev1: &AxEvent<B>, ev2: &AxEvent<B>) -> Sexp {
+    use Sexp::*;
+    match (ev1.address(), ev2.address()) {
+        (Some(Val::Symbolic(sym1)), Some(Val::Symbolic(sym2))) => {
+            if sym1 == sym2 {
+                True
+            } else {
+                Literal(format!("(= ((_ extract 11 0) v{}) ((_ extract 11 0) v{}))", sym1, sym2))
+            }
+        }
+        (Some(Val::Bits(bv)), Some(Val::Symbolic(sym))) | (Some(Val::Symbolic(sym)), Some(Val::Bits(bv))) => {
+            Literal(format!("(= ((_ extract 11 0) v{}) #x{:03x})", sym, bv.lower_u64() & 0xFFF))
+        }
+        (Some(Val::Bits(bv1)), Some(Val::Bits(bv2))) => {
+            if (bv1.lower_u64() & 0xFFF) == (bv2.lower_u64() & 0xFFF) {
+                True
+            } else {
+                False
+            }
+        }
+        (_, _) => False,
+    }
+}
+
 fn overlap_location<B: BV>(ev1: &AxEvent<B>, ev2: &AxEvent<B>) -> Sexp {
     use Sexp::*;
 
@@ -925,6 +949,7 @@ pub fn smt_of_candidate<B: BV>(
     smt_condition_rel(disjoint, events, same_location).write_rel(output, "loc")?;
     smt_condition_rel(disjoint, events, overlap_location).write_rel(output, "overlap-loc")?;
     smt_condition_rel(po, events, same_location).write_rel(output, "po-loc")?;
+    smt_condition_rel(disjoint, events, same_page_offset).write_rel(output, "same-page-offset")?;
     smt_condition_rel(univ, events, read_write_pair).write_rel(output, "rw-pair")?;
     smt_dep_rel2(addr, events, &exec.thread_opcodes, footprints, shared_state).write_rel(output, "addr")?;
     smt_dep_rel2(data, events, &exec.thread_opcodes, footprints, shared_state).write_rel(output, "data")?;
