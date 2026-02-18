@@ -43,7 +43,7 @@ use isla_cat::smt::Sexp;
 use isla_mml::accessor::ModelEvent;
 
 use crate::axiomatic::relations::*;
-use crate::axiomatic::{AxEvent, ExecutionInfo};
+use crate::axiomatic::{AxEvent, ExecutionInfo, Translations};
 use crate::footprint_analysis::Footprint;
 use crate::litmus::{exp::Exp, exp::Loc, opcode_from_objdump, Litmus};
 use crate::smt_model::pairwise::Pairs;
@@ -372,6 +372,83 @@ fn translate_read_invalid<B: BV>(ev: &AxEvent<B>) -> Sexp {
     } else {
         Sexp::False
     }
+}
+
+/// For each translation, find its final-level (leaf) descriptor
+/// reads and build T_af0 conditions for the events owning them: a
+/// leaf that is valid (bit 0 set) with AF clear (bit 10 clear). The
+/// last read outside the stage 2 tables is the leaf of the stage 1
+/// (or only) walk. Stage 2 sub-walk leaves are found by scanning
+/// descriptor values in walk order: below level 3 a valid table
+/// descriptor (bits 1:0 = 0b11) continues a sub-walk, anything else
+/// ends it. If a stage 2 descriptor is symbolic the scan gives up
+/// and only the last stage 2 read is treated as a leaf. Merged
+/// translate events own all their constituent reads.
+fn translate_read_af0_conditions<B: BV>(translations: &Translations<'_, '_, B>) -> HashMap<String, Vec<Sexp>> {
+    let mut conds: HashMap<String, Vec<Sexp>> = HashMap::new();
+
+    for translation in translations.iter_translations() {
+        let mut primary_leaf: Option<(&str, &Val<B>)> = None;
+        let mut s2_reads: Vec<(&str, &Val<B>)> = Vec::new();
+
+        for ev in translation {
+            for base_event in &ev.base {
+                if let Event::ReadMem { value, bytes, region, .. } = base_event {
+                    if *bytes == 8 {
+                        if *region == "stage 2" {
+                            s2_reads.push((&ev.name, value))
+                        } else {
+                            primary_leaf = Some((&ev.name, value))
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut s2_leaves: Vec<(&str, &Val<B>)> = Vec::new();
+        let mut level = 0;
+        for (name, value) in s2_reads.iter().copied() {
+            match value {
+                Val::Bits(bv) => {
+                    let valid = bv.slice(0, 1).unwrap() != B::zeros(1);
+                    let table_bit = bv.slice(1, 1).unwrap() != B::zeros(1);
+                    if level < 3 && valid && table_bit {
+                        level += 1
+                    } else {
+                        s2_leaves.push((name, value));
+                        level = 0
+                    }
+                }
+                _ => {
+                    s2_leaves.clear();
+                    s2_leaves.extend(s2_reads.last().copied());
+                    break;
+                }
+            }
+        }
+
+        for (name, value) in primary_leaf.into_iter().chain(s2_leaves) {
+            match value {
+                Val::Bits(bv) => {
+                    let valid = bv.slice(0, 1).unwrap() != B::zeros(1);
+                    let af_clear = bv.slice(10, 1).unwrap() == B::zeros(1);
+                    if valid && af_clear {
+                        conds.entry(name.to_string()).or_default().push(Sexp::True)
+                    }
+                }
+                _ => {
+                    let v = smt_bitvec(value);
+                    conds.entry(name.to_string()).or_default().push(Sexp::Literal(format!(
+                        "(and (not (= (bvand {} #x0000000000000001) #x0000000000000000)) \
+                              (= (bvand {} #x0000000000000400) #x0000000000000000))",
+                        v, v
+                    )))
+                }
+            }
+        }
+    }
+
+    conds
 }
 
 fn dep_rel_target<B: BV>(ev: &AxEvent<B>, shared_state: &SharedState<B>) -> Sexp {
@@ -843,10 +920,20 @@ pub fn smt_of_candidate<B: BV>(
         }
 
         smt_condition_set(|ev| translate_read_invalid(ev), events).write_set(output, "T_f")?;
+        let t_af0_conds = translate_read_af0_conditions(&translations);
+        smt_condition_set(
+            |ev| match t_af0_conds.get(&ev.name) {
+                Some(conds) => Sexp::Or(conds.clone()),
+                None => Sexp::False,
+            },
+            events,
+        )
+        .write_set(output, "T_af0")?;
     } else {
         smt_empty().write_rel(output, "trf1-internal")?;
         smt_empty().write_rel(output, "trf2-internal")?;
         smt_empty().write_set(output, "T_f")?;
+        smt_empty().write_set(output, "T_af0")?;
     }
 
     smt_set(|ev| is_read(ev) || is_write(ev), events).write_set(output, "M")?;
