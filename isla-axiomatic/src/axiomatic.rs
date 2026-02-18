@@ -335,6 +335,12 @@ impl<'exec, 'ev, B: BV> Translations<'exec, 'ev, B> {
         // The IPA 4k page is determined by the final s2 indices
         Some(VirtualAddress::from_indices(indices[l - 4], indices[l - 3], indices[l - 2], indices[l - 1], 0))
     }
+
+    /// Iterate over the translate events of each translation, sorted
+    /// in intra-instruction order
+    pub fn iter_translations(&self) -> impl Iterator<Item = &[&'exec AxEvent<'ev, B>]> + '_ {
+        self.translations.values().map(|events| events.as_slice())
+    }
 }
 
 pub mod relations {
