@@ -115,10 +115,11 @@ impl<E: Error> Error for LitmusRunError<E> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PCLimitMode {
     Error,
     Discard,
+    Lazy,
 }
 
 #[derive(Debug)]
@@ -365,7 +366,7 @@ where
             Some(Err(err)) => match err {
                 TraceError::Exec { err: ExecError::PCLimitReached(_), .. } => match opts.pc_limit_mode {
                     PCLimitMode::Error => return Err(LitmusRunError::Trace(err)),
-                    PCLimitMode::Discard => discarded += 1,
+                    PCLimitMode::Discard | PCLimitMode::Lazy => discarded += 1,
                 },
                 _ => return Err(LitmusRunError::Trace(err)),
             },
