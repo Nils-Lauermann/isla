@@ -167,7 +167,7 @@ fn make_cmdline_opts() -> getopts::Options {
     opts.optopt("", "only-group", "only perform jobs for one thread group", "<n>");
     opts.optopt("s", "timeout", "Add a timeout (in seconds)", "<n>");
     opts.optopt("", "pc-limit", "Limit the number of times each instruction can be visited", "<n>");
-    opts.optopt("", "pc-limit-mode", "What to do when the pc-limit is exceeded (default error)", "<error|discard>");
+    opts.optopt("", "pc-limit-mode", "What to do when the pc-limit is exceeded (default error)", "<error|discard|lazy>");
     opts.optopt("", "memory", "Add a max memory consumption (in megabytes)", "<n>");
     opts.optopt("m", "model", "Memory model in cat format", "<path>");
     opts.optflag("", "ifetch", "Generate ifetch events");
@@ -327,8 +327,9 @@ fn isla_main() -> i32 {
     let pc_limit_mode: PCLimitMode = match matches.opt_str("pc-limit-mode").as_deref() {
         Some("error") | None => PCLimitMode::Error,
         Some("discard") => PCLimitMode::Discard,
+        Some("lazy") => PCLimitMode::Lazy,
         _ => {
-            eprintln!("Unknown value for --pc-limit-mode flag. Accepted values are 'error' and 'discard'");
+            eprintln!("Unknown value for --pc-limit-mode flag. Accepted values are 'error', 'discard', and 'lazy'");
             return 1;
         }
     };
@@ -833,29 +834,50 @@ fn isla_main() -> i32 {
 
                     let ref_result = refs.get(&litmus.name);
 
-                    if let Err(err) = run_info {
-                        let msg = format!("{}", err);
-                        eprintln!(
-                            "{}",
-                            err.source_loc().message(source_path.as_ref(), symtab.files(), &msg, true, true)
-                        );
-                        print_results(
-                            print_like_herd7,
-                            &litmus,
-                            shared_state,
-                            now,
-                            &[Error(None, "".to_string())],
-                            ref_result,
-                        );
-                        continue;
-                    }
+                    let run_info = match run_info {
+                        Ok(info) => info,
+                        Err(err) => {
+                            let msg = format!("{}", err);
+                            eprintln!(
+                                "{}",
+                                err.source_loc().message(source_path.as_ref(), symtab.files(), &msg, true, true)
+                            );
+                            print_results(
+                                print_like_herd7,
+                                &litmus,
+                                shared_state,
+                                now,
+                                &[Error(None, "".to_string())],
+                                ref_result,
+                                0,
+                                false,
+                            );
+                            continue;
+                        }
+                    };
 
                     let mut results: Vec<AxResult> = Vec::new();
                     while let Some(result) = result_queue.pop() {
                         results.push(result)
                     }
 
-                    print_results(print_like_herd7, &litmus, shared_state, now, &results, ref_result);
+                    // In lazy mode: if no allowed results and some traces were
+                    // discarded, the test is an error (we cannot conclude
+                    // "forbidden" with incomplete execution)
+                    let lazy_incomplete = pc_limit_mode == PCLimitMode::Lazy
+                        && run_info.discarded > 0
+                        && !results.iter().any(|r| r.is_allowed());
+
+                    print_results(
+                        print_like_herd7,
+                        &litmus,
+                        shared_state,
+                        now,
+                        &results,
+                        ref_result,
+                        run_info.discarded,
+                        lazy_incomplete,
+                    );
 
                     for (i, allowed) in results.iter().enumerate() {
                         let (maybe_graph, state) = match allowed {
@@ -952,7 +974,7 @@ fn isla_main() -> i32 {
 }
 
 #[allow(unused)]
-fn print_results_legacy(name: &str, start_time: Instant, results: &[AxResult], expected: Option<&AxResult>) {
+fn print_results_legacy(name: &str, start_time: Instant, results: &[AxResult], expected: Option<&AxResult>, discarded: u32, lazy_incomplete: bool) {
     if results.is_empty() {
         let prefix = format!("{} no executions {}", name, start_time.elapsed().as_millis());
         println!("{:.<100} \x1b[95m\x1b[1merror\x1b[0m", prefix);
@@ -966,6 +988,10 @@ fn print_results_legacy(name: &str, start_time: Instant, results: &[AxResult], e
     } else {
         results.first().unwrap()
     };
+
+    // lazy_incomplete means we cannot conclude "forbidden" because some
+    // traces were discarded due to pc-limit, so we report "error" instead
+    let status_name = if lazy_incomplete { "error" } else { got.short_name() };
 
     if let AxResult::Error(_, z3_output) = got {
         eprintln!("Error in parsing smt output to get allowed/forbidden ...");
@@ -982,25 +1008,29 @@ fn print_results_legacy(name: &str, start_time: Instant, results: &[AxResult], e
         }
     }
 
-    let count = format!("{} of {}", results.iter().filter(|result| result.is_allowed()).count(), results.len());
+    let count = if discarded > 0 {
+        format!("{} of {}?", results.iter().filter(|result| result.is_allowed()).count(), results.len())
+    } else {
+        format!("{} of {}", results.iter().filter(|result| result.is_allowed()).count(), results.len())
+    };
 
     let prefix = if let Some(reference) = expected {
         format!(
             "{} {} ({}) reference: {} {}ms ",
             name,
-            got.short_name(),
+            status_name,
             count,
             reference.short_name(),
             start_time.elapsed().as_millis()
         )
     } else {
-        format!("{} {} ({}) {}ms ", name, got.short_name(), count, start_time.elapsed().as_millis())
+        format!("{} {} ({}) {}ms ", name, status_name, count, start_time.elapsed().as_millis())
     };
 
     let result = if let Some(reference) = expected {
-        if got.matches(reference) {
+        if !lazy_incomplete && got.matches(reference) {
             "\x1b[92m\x1b[1mok\x1b[0m"
-        } else if got.is_error() {
+        } else if lazy_incomplete || got.is_error() {
             FAILURE.store(true, Ordering::Relaxed);
             "\x1b[95m\x1b[1merror\x1b[0m"
         } else {
@@ -1008,7 +1038,11 @@ fn print_results_legacy(name: &str, start_time: Instant, results: &[AxResult], e
             "\x1b[91m\x1b[1mfail\x1b[0m"
         }
     } else {
-        "\x1b[93m\x1b[1m?\x1b[0m"
+        if lazy_incomplete {
+            "\x1b[95m\x1b[1merror\x1b[0m"
+        } else {
+            "\x1b[93m\x1b[1m?\x1b[0m"
+        }
     };
 
     println!("{:.<100} {}", prefix, result)
@@ -1143,11 +1177,13 @@ fn print_results<'ir>(
     start_time: Instant,
     results: &[AxResult],
     expected: Option<&AxResult>,
+    discarded: u32,
+    lazy_incomplete: bool,
 ) {
     if herd_style {
         print_results_herd7(litmus, shared_state, start_time, results, expected)
     } else {
-        print_results_legacy(&litmus.name, start_time, results, expected)
+        print_results_legacy(&litmus.name, start_time, results, expected, discarded, lazy_incomplete)
     }
 }
 
