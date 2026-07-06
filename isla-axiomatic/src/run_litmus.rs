@@ -569,6 +569,11 @@ where
             if let Some(split_stages) = opts.merge_translations {
                 exec.merge_translations(split_stages, &mut memory_model_symtab)
             }
+            // Per-thread TLBI splitting is opted into by the memory
+            // model declaring the tlb-affects-thread relation
+            if memory_model_symtab.lookup("tlb-affects-thread").is_some() {
+                exec.split_tlbis(arch.shared_state, &mut memory_model_symtab);
+            }
 
             let mut path = cache.as_ref().to_owned();
             path.push(format!(

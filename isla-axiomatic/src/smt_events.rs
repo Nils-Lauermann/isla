@@ -1009,6 +1009,7 @@ pub fn smt_of_candidate<B: BV>(
     smt_basic_rel(internal, events).write_rel(output, "int")?;
     smt_basic_rel(external, events).write_rel(output, "ext")?;
     smt_basic_rel(same_translation, events).write_rel(output, "same-translation")?;
+    smt_basic_rel(tlb_affects_thread, events).write_rel(output, "tlb-affects-thread")?;
     smt_condition_rel(disjoint, events, same_location).write_rel(output, "loc")?;
     smt_condition_rel(disjoint, events, overlap_location).write_rel(output, "overlap-loc")?;
     smt_condition_rel(po, events, same_location).write_rel(output, "po-loc")?;
