@@ -151,6 +151,8 @@ pub struct AxEvent<'ev, B> {
     pub is_ifetch: bool,
     /// Is the event associated with an address translation function?
     pub translate: Option<TranslationId>,
+    /// For TLBI events, the thread whose TLB this per-thread copy invalidates
+    pub tlbi_target: Option<ThreadId>,
 }
 
 impl<'ev, B: BV> ModelEvent<'ev, B> for AxEvent<'ev, B> {
@@ -386,6 +388,11 @@ pub mod relations {
             (Some(trans_id1), Some(trans_id2)) => trans_id1 == trans_id2,
             (_, _) => false,
         }
+    }
+
+    /// Relates a per-thread TLBI copy to the events of its target thread (symmetric)
+    pub fn tlb_affects_thread<B: BV>(ev1: &AxEvent<B>, ev2: &AxEvent<B>) -> bool {
+        ev1.tlbi_target == Some(ev2.thread_id) || ev2.tlbi_target == Some(ev1.thread_id)
     }
 
     pub fn amo<B: BV>(
@@ -845,6 +852,7 @@ impl<'ev, B: BV> ExecutionInfo<'ev, B> {
                     extra: Vec::new(),
                     is_ifetch: false,
                     translate: Some(trans_id),
+                    tlbi_target: None,
                 });
                 self.smt_events.push(AxEvent {
                     opcode: Some(merged.opcode),
@@ -859,6 +867,7 @@ impl<'ev, B: BV> ExecutionInfo<'ev, B> {
                     extra: Vec::new(),
                     is_ifetch: false,
                     translate: Some(trans_id),
+                    tlbi_target: None,
                 })
             } else {
                 let name = format!("TRANS_{}", trans_id);
@@ -875,9 +884,72 @@ impl<'ev, B: BV> ExecutionInfo<'ev, B> {
                     extra: Vec::new(),
                     is_ifetch: false,
                     translate: Some(trans_id),
+                    tlbi_target: None,
                 })
             }
         }
+    }
+
+    /// Split each broadcast TLBI event into one event per thread of
+    /// the candidate, so it can complete at a different wco position
+    /// for each thread. The original event becomes the copy for its
+    /// own thread; copies share the underlying trace event and the po
+    /// slot, so they stay mutually unordered. Non-broadcast TLBIs are
+    /// not split but still target their own thread, keeping
+    /// tlb-affects-thread non-empty for them.
+    pub fn split_tlbis(&mut self, shared_state: &SharedState<B>, symtab: &mut memory_model::Symtab) {
+        let tlbi_name = shared_state.symtab.get("zsail_tlbi");
+        let shareability_field = shared_state.symtab.get("zshareability");
+        let shareability_enum = shared_state.symtab.get("zShareability");
+        let nsh = shared_state.enum_member_from_str("Shareability_NSH");
+        let num_threads = self.thread_opcodes.len();
+
+        let mut copies = Vec::new();
+        for ev in self.smt_events.iter_mut() {
+            let args = match ev.base() {
+                Some(Event::Abstract { name, args, .. }) if Some(*name) == tlbi_name => args,
+                _ => continue,
+            };
+            ev.tlbi_target = Some(ev.thread_id);
+            // On an unreadable or symbolic payload err towards
+            // splitting: extra copies of a non-broadcast TLBI are
+            // inert, while an unsplit broadcast TLBI would lose its
+            // remote invalidation orderings
+            let non_broadcast = match args.first() {
+                Some(Val::Struct(fields)) => match shareability_field.and_then(|f| fields.get(&f)) {
+                    Some(Val::Enum(e)) if Some(e.enum_id.to_name()) == shareability_enum => {
+                        nsh.is_some() && nsh == Some(e.member)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if non_broadcast {
+                continue;
+            }
+            for target in 0..num_threads {
+                if target == ev.thread_id {
+                    continue;
+                }
+                let name = format!("{}_t{}", ev.name, target);
+                copies.push(AxEvent {
+                    opcode: ev.opcode,
+                    instruction_index: ev.instruction_index,
+                    intra_instruction_index: ev.intra_instruction_index,
+                    in_program_order: ev.in_program_order,
+                    thread_id: ev.thread_id,
+                    name: name.clone(),
+                    mm_name: symtab.intern_owned(name),
+                    base: ev.base.clone(),
+                    index_set: ev.index_set,
+                    extra: Vec::new(),
+                    is_ifetch: false,
+                    translate: None,
+                    tlbi_target: Some(target),
+                })
+            }
+        }
+        self.smt_events.append(&mut copies);
     }
 
     pub fn from(
@@ -1074,6 +1146,7 @@ impl<'ev, B: BV> ExecutionInfo<'ev, B> {
                             extra: vec![],
                             is_ifetch,
                             translate,
+                            tlbi_target: None,
                         })
                     }
                 }
