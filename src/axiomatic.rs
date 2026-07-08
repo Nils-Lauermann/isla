@@ -48,8 +48,8 @@ use isla_axiomatic::graph::{
 };
 
 use isla_axiomatic::axiomatic::{final_state_from_z3_output, FinalLocValuesError};
-use isla_axiomatic::litmus::exp::{collect_locs, Loc as LitmusLoc};
-use isla_axiomatic::litmus::Litmus;
+use isla_axiomatic::litmus::exp::{collect_locs, Exp, Loc as LitmusLoc};
+use isla_axiomatic::litmus::{FinalKind, Litmus};
 use isla_axiomatic::page_table::{name_initial_walk_bitvectors, VirtualAddress};
 use isla_axiomatic::run_litmus;
 use isla_axiomatic::run_litmus::{LitmusRunOpts, PCLimitMode};
@@ -168,6 +168,7 @@ fn make_cmdline_opts() -> getopts::Options {
     opts.optopt("s", "timeout", "Add a timeout (in seconds)", "<n>");
     opts.optopt("", "pc-limit", "Limit the number of times each instruction can be visited", "<n>");
     opts.optopt("", "pc-limit-mode", "What to do when the pc-limit is exceeded (default error)", "<error|discard|lazy>");
+    opts.optopt("", "force-kind", "Override the litmus [final].kind (e.g. exists to skip forall negation)", "<exists|notexists|forall>");
     opts.optopt("", "memory", "Add a max memory consumption (in megabytes)", "<n>");
     opts.optopt("m", "model", "Memory model in cat format", "<path>");
     opts.optflag("", "ifetch", "Generate ifetch events");
@@ -408,6 +409,7 @@ fn isla_main() -> i32 {
     };
 
     let exhaustive = matches.opt_present("exhaustive");
+    let force_kind = matches.opt_str("force-kind").map(|s| FinalKind::from_str(&s));
 
     let timeout: Option<u64> = match matches.opt_get("timeout") {
         Ok(timeout) => timeout,
@@ -615,12 +617,35 @@ fn isla_main() -> i32 {
                         }
                     };
 
-                    let litmus = match Litmus::parse(&litmus, symtab, type_info, isa_config) {
+                    let mut litmus = match Litmus::parse(&litmus, symtab, type_info, isa_config) {
                         Ok(litmus) => litmus,
                         Err(msg) => {
                             eprintln!("Failed to parse litmus file: {}\n{}", litmus_file.display(), msg);
                             continue;
                         }
+                    };
+
+                    // isla checks the assertion existentially, so a forall test
+                    // is checked by its negation: ~P forbidden in every execution
+                    // means P holds always (Required). --force-kind overrides the
+                    // toml kind (e.g. exists to evaluate the original assertion).
+                    // For forall we check the negation ~P (unsat everywhere =>
+                    // Required); keep the original P for the possible second pass
+                    // that distinguishes Sometimes from Never.
+                    let effective_kind = force_kind.unwrap_or(litmus.final_kind);
+                    let forall_original: Option<Exp<String>> = if effective_kind == FinalKind::Forall {
+                        let original = std::mem::replace(&mut litmus.final_assertion, Exp::True);
+                        litmus.final_assertion = Exp::Not(Box::new(original.clone()));
+                        log!(
+                            log::VERBOSE,
+                            &format!(
+                                "Detected forall kind, checking negated assertion: {}",
+                                litmus.final_assertion.display(&shared_state.symtab, litmus.final_assertion.precedence())
+                            )
+                        );
+                        Some(original)
+                    } else {
+                        None
                     };
 
                     if let Some(path) = latex_path {
@@ -834,7 +859,7 @@ fn isla_main() -> i32 {
 
                     let ref_result = refs.get(&litmus.name);
 
-                    let run_info = match run_info {
+                    let mut run_info = match run_info {
                         Ok(info) => info,
                         Err(err) => {
                             let msg = format!("{}", err);
@@ -851,6 +876,7 @@ fn isla_main() -> i32 {
                                 ref_result,
                                 0,
                                 false,
+                                None,
                             );
                             continue;
                         }
@@ -859,6 +885,64 @@ fn isla_main() -> i32 {
                     let mut results: Vec<AxResult> = Vec::new();
                     while let Some(result) = result_queue.pop() {
                         results.push(result)
+                    }
+
+                    // forall: the run above was ~P. If nothing is allowed, ~P is
+                    // unsatisfiable everywhere, so P holds in all executions =>
+                    // Required. Otherwise (a counterexample exists) silently rerun
+                    // the original P and report its usual allowed(Sometimes) /
+                    // forbidden(Never) output. The second pass uses a minimal
+                    // callback (verdict only; graphs/inspector are for pass 1).
+                    let mut status_override: Option<&str> = None;
+                    if let Some(original) = forall_original {
+                        if !results.iter().any(|r| r.is_allowed()) {
+                            status_override = Some("required");
+                        } else {
+                            litmus.final_assertion = original;
+                            let rerun = run_litmus::smt_output_per_candidate::<B129, _, _, FinalLocValuesError>(
+                                &uid,
+                                &opts,
+                                &litmus,
+                                &graph_opts,
+                                iarch,
+                                fiarch,
+                                sexps,
+                                mm_compiled,
+                                mm_symtab,
+                                accessors,
+                                extra_smt,
+                                check_sat_using,
+                                get_z3_model,
+                                cache,
+                                &|_exec, _memory, _all_addrs, _tables, _footprints, z3_output, _smt_path| {
+                                    if z3_output.starts_with("sat") {
+                                        result_queue.push(Allowed(None, None));
+                                    } else if z3_output.starts_with("unsat") {
+                                        result_queue.push(Forbidden(None, None));
+                                    } else {
+                                        result_queue.push(Error(None, z3_output.to_string()));
+                                    }
+                                    Ok(())
+                                },
+                            );
+                            results.clear();
+                            match rerun {
+                                Ok(info) => {
+                                    run_info = info;
+                                    while let Some(result) = result_queue.pop() {
+                                        results.push(result)
+                                    }
+                                }
+                                Err(err) => {
+                                    let msg = format!("{}", err);
+                                    eprintln!(
+                                        "{}",
+                                        err.source_loc().message(source_path.as_ref(), symtab.files(), &msg, true, true)
+                                    );
+                                    results.push(Error(None, "".to_string()));
+                                }
+                            }
+                        }
                     }
 
                     // In lazy mode: if no allowed results and some traces were
@@ -877,6 +961,7 @@ fn isla_main() -> i32 {
                         ref_result,
                         run_info.discarded,
                         lazy_incomplete,
+                        status_override,
                     );
 
                     for (i, allowed) in results.iter().enumerate() {
@@ -974,7 +1059,7 @@ fn isla_main() -> i32 {
 }
 
 #[allow(unused)]
-fn print_results_legacy(name: &str, start_time: Instant, results: &[AxResult], expected: Option<&AxResult>, discarded: u32, lazy_incomplete: bool) {
+fn print_results_legacy(name: &str, start_time: Instant, results: &[AxResult], expected: Option<&AxResult>, discarded: u32, lazy_incomplete: bool, status_override: Option<&str>) {
     if results.is_empty() {
         let prefix = format!("{} no executions {}", name, start_time.elapsed().as_millis());
         println!("{:.<100} \x1b[95m\x1b[1merror\x1b[0m", prefix);
@@ -991,7 +1076,7 @@ fn print_results_legacy(name: &str, start_time: Instant, results: &[AxResult], e
 
     // lazy_incomplete means we cannot conclude "forbidden" because some
     // traces were discarded due to pc-limit, so we report "error" instead
-    let status_name = if lazy_incomplete { "error" } else { got.short_name() };
+    let status_name = if lazy_incomplete { "error" } else { status_override.unwrap_or_else(|| got.short_name()) };
 
     if let AxResult::Error(_, z3_output) = got {
         eprintln!("Error in parsing smt output to get allowed/forbidden ...");
@@ -1179,11 +1264,12 @@ fn print_results<'ir>(
     expected: Option<&AxResult>,
     discarded: u32,
     lazy_incomplete: bool,
+    status_override: Option<&str>,
 ) {
     if herd_style {
         print_results_herd7(litmus, shared_state, start_time, results, expected)
     } else {
-        print_results_legacy(&litmus.name, start_time, results, expected, discarded, lazy_incomplete)
+        print_results_legacy(&litmus.name, start_time, results, expected, discarded, lazy_incomplete, status_override)
     }
 }
 

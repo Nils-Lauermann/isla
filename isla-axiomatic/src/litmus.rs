@@ -971,6 +971,28 @@ pub struct LitmusGraphOpts {
     pub shows: Option<Vec<String>>,
 }
 
+/// The `[final].kind` from a litmus test. isla always evaluates the assertion
+/// existentially; `Forall` asks the caller to check the negated assertion (see
+/// axiomatic.rs). Absent kind = existential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalKind {
+    Exists,
+    NotExists,
+    Forall,
+    Unconstrained,
+}
+
+impl FinalKind {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "forall" => FinalKind::Forall,
+            "notexists" => FinalKind::NotExists,
+            "unconstrained" => FinalKind::Unconstrained,
+            _ => FinalKind::Exists,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Litmus<B> {
     pub arch: String,
@@ -986,6 +1008,7 @@ pub struct Litmus<B> {
     pub self_modify_regions: Vec<Region<B>>,
     pub objdump: Objdump,
     pub final_assertion: exp::Exp<String>,
+    pub final_kind: FinalKind,
     pub graph_opts: LitmusGraphOpts,
 }
 
@@ -1147,6 +1170,7 @@ impl<B: BV> Litmus<B> {
             }
             None => Err("No final.assertion found in litmus file".to_string()),
         })?;
+        let final_kind = fin.get("kind").and_then(Value::as_str).map(FinalKind::from_str).unwrap_or(FinalKind::Exists);
 
         let meta = litmus_toml.get("meta");
 
@@ -1178,6 +1202,7 @@ impl<B: BV> Litmus<B> {
             self_modify_regions,
             objdump,
             final_assertion,
+            final_kind,
             graph_opts,
         })
     }
