@@ -661,7 +661,8 @@ pub fn interrupt_pending<'ir, B: BV>(
 
             log_from!(tid, log::VERBOSE, "Injecting pending interrupt");
             for (loc, reset) in &interrupt.reset {
-                let value = reset(&frame.memory, shared_state.typedefs(), solver)?;
+                let value =
+                    wrap_reset_in_bitfield_struct(loc, reset(&frame.memory, shared_state.typedefs(), solver)?, shared_state);
                 let mut accessor = Vec::new();
                 assign_with_accessor(
                     loc,
@@ -683,6 +684,25 @@ pub fn interrupt_pending<'ir, B: BV>(
     Ok(false)
 }
 
+/// Reset values are plain bitvectors, but some registers are declared
+/// as single-bitvector-field wrapper structs (Armv9.4 _TTBR0_EL1 has
+/// { zbits: bv(128) }, SPSR_EL1 { bits: bv(64) }). Wrap and zero-extend
+/// such values so later field accesses see a struct.
+fn wrap_reset_in_bitfield_struct<B: BV>(loc: &Loc<Name>, value: Val<B>, shared_state: &SharedState<B>) -> Val<B> {
+    let Loc::Id(id) = loc else { return value };
+    let Some(Ty::Struct(struct_name)) = shared_state.registers.get(id) else { return value };
+    let Some(fields) = shared_state.typedefs().structs.get(struct_name) else { return value };
+    let mut fields = fields.iter();
+    match (fields.next(), fields.next(), &value) {
+        (Some((field, Ty::Bits(width))), None, Val::Bits(bv)) if bv.len() <= *width => {
+            let mut struct_val: HashMap<Name, Val<B>, ahash::RandomState> = HashMap::default();
+            struct_val.insert(*field, Val::Bits(bv.zero_extend(*width)));
+            Val::Struct(struct_val)
+        }
+        _ => value,
+    }
+}
+
 pub fn reset_registers<'ir, B: BV>(
     _tid: usize,
     frame: &mut LocalFrame<'ir, B>,
@@ -693,7 +713,8 @@ pub fn reset_registers<'ir, B: BV>(
 ) -> Result<(), ExecError> {
     for (loc, reset) in &shared_state.reset_registers {
         if !task_state.reset_registers.contains_key(loc) {
-            let value = reset(&frame.memory, shared_state.typedefs(), solver)?;
+            let value =
+                wrap_reset_in_bitfield_struct(loc, reset(&frame.memory, shared_state.typedefs(), solver)?, shared_state);
             let mut accessor = Vec::new();
             assign_with_accessor(
                 loc,
@@ -713,7 +734,8 @@ pub fn reset_registers<'ir, B: BV>(
         }
     }
     for (loc, reset) in &task_state.reset_registers {
-        let value = reset(&frame.memory, shared_state.typedefs(), solver)?;
+        let value =
+            wrap_reset_in_bitfield_struct(loc, reset(&frame.memory, shared_state.typedefs(), solver)?, shared_state);
         let mut accessor = Vec::new();
         assign_with_accessor(loc, value.clone(), &mut frame.local_state, shared_state, solver, &mut accessor, info)?;
         solver.add_event(Event::AssumeReg(loc.id(), accessor, value));
@@ -1398,7 +1420,20 @@ fn run_loop<'ir, 'task, B: BV>(
                                     let i = i128_from_bits(&bv);
                                     (Bits(bv), Val::I128(i))
                                 }
-                                _ => panic!("failed to interpret monomorphized value"),
+                                // wide (> 64 bit) registers, e.g. the Armv9.4 128-bit TTBRs
+                                Ty::Bits(_) | Ty::AnyBits if bv.len() as u32 <= B::MAX_WIDTH => {
+                                    if let Ty::Bits(len) = ty {
+                                        assert!(*len as usize == bv.len());
+                                    }
+                                    let mut val = B::zeros(bv.len() as u32);
+                                    for (n, bit) in bv.iter().enumerate() {
+                                        if *bit {
+                                            val = val.set_slice(n as u32, B::new(1, 1));
+                                        }
+                                    }
+                                    (Bits(bv), Val::Bits(val))
+                                }
+                                _ => panic!("failed to interpret monomorphized value of width {} as {:?}", bv.len(), ty),
                             },
 
                             Ok(ModelVal::Exp(Bool(b))) => (Bool(b), Val::Bool(b)),
