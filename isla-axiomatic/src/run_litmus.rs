@@ -559,6 +559,21 @@ where
                 &mut memory_model_symtab,
             )
             .map_err(internal_err)?;
+            // Threads terminate by fetching past their code; that stray fetch
+            // has no objdump opcode and would make every candidate unsat
+            if !opts.ignore_ifetch {
+                exec.smt_events.retain(|ev| {
+                    if !ev.is_ifetch {
+                        return true;
+                    }
+                    match ev.address() {
+                        Some(Val::Bits(addr)) => {
+                            crate::litmus::opcode_from_objdump(*addr, &litmus.objdump).is_some()
+                        }
+                        _ => true,
+                    }
+                });
+            }
             if let Some(keep_entire_translation) = opts.remove_uninteresting_translates {
                 exec.remove_uninteresting_translates(
                     &candidate.page_table_setup.maybe_mapped,
