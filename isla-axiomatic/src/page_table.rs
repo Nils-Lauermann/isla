@@ -38,10 +38,10 @@ use isla_lib::error::ExecError;
 use isla_lib::ir::Val;
 use isla_lib::log;
 use isla_lib::memory::{CustomRegion, Memory};
-use isla_lib::primop_util::{length_bits, smt_sbits};
+use isla_lib::primop_util::length_bits;
 use isla_lib::smt::{
     smtlib::{bits64, Exp, Ty},
-    Event, ReadOpts, SmtResult, Solver, Sym, WriteOpts,
+    Event, Model, ModelVal, ReadOpts, SmtResult, Solver, Sym, WriteOpts,
 };
 use isla_lib::source_loc::SourceLoc;
 
@@ -718,6 +718,10 @@ pub struct PageTables<B> {
     base_addr: u64,
     tables: Vec<PageTable<B>>,
     region: &'static str,
+    /// physical page base -> name of a pa in that page (e.g. "pa_y")
+    page_names: HashMap<u64, String>,
+    /// address of a level 3 pte -> name of a va mapping through it (e.g. "x")
+    pte_names: HashMap<u64, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -725,6 +729,8 @@ pub struct ImmutablePageTables<B> {
     base_addr: u64,
     tables: Arc<[PageTable<B>]>,
     region: &'static str,
+    page_names: Arc<HashMap<u64, String>>,
+    pte_names: Arc<HashMap<u64, String>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -764,7 +770,7 @@ impl<B: BV> PageTables<B> {
     /// point to any valid translation table, so does not have to
     /// match this value.
     pub fn new(region: &'static str, base_addr: u64) -> Self {
-        PageTables { base_addr, tables: Vec::new(), region }
+        PageTables { base_addr, tables: Vec::new(), region, page_names: HashMap::new(), pte_names: HashMap::new() }
     }
 
     pub fn range(&self) -> Range<u64> {
@@ -938,12 +944,117 @@ impl<B: BV> PageTables<B> {
         self.map(level0, VirtualAddress::from_u64(page), page, false, attrs, level)
     }
 
+    /// The address of the level 3 entry a virtual address resolves to,
+    /// following concrete table descriptors only.
+    fn l3pte_addr(&self, level0: Index, va: VirtualAddress) -> Option<u64> {
+        let mut table = level0;
+        for level in 0..3 {
+            let table_addr = match &self.get(table)[va.level_index(level)] {
+                Desc::Concrete(bits) if bits & 0b11 == 0b11 => bits & !0xFFF,
+                _ => return None,
+            };
+            if table_addr < self.base_addr {
+                return None;
+            }
+            let ix = ((table_addr - self.base_addr) >> 12) as usize;
+            if ix >= self.tables.len() {
+                return None;
+            }
+            table = Index { base_addr: self.base_addr, ix };
+        }
+        Some(table_address(table) + 8 * va.level_index(3) as u64)
+    }
+
+    pub fn name_page(&mut self, page: u64, name: &str) {
+        self.page_names.insert(page & !0xFFF, name.to_string());
+    }
+
+    pub fn name_va_l3pte(&mut self, level0: Index, va: VirtualAddress, name: &str) {
+        if let Some(pte) = self.l3pte_addr(level0, va) {
+            self.pte_names.insert(pte, name.to_string());
+        }
+    }
+
     pub fn freeze(&self) -> ImmutablePageTables<B> {
-        ImmutablePageTables { base_addr: self.base_addr, tables: self.tables.clone().into(), region: self.region }
+        ImmutablePageTables {
+            base_addr: self.base_addr,
+            tables: self.tables.clone().into(),
+            region: self.region,
+            page_names: Arc::new(self.page_names.clone()),
+            pte_names: Arc::new(self.pte_names.clone()),
+        }
     }
 }
 
 impl<B: BV> ImmutablePageTables<B> {
+    /// Pretty print a descriptor in page_table_setup syntax. Returns None
+    /// unless it is a level 3 page descriptor over a named page with all
+    /// set bits covered by the output address or a known field.
+    pub fn print_desc(&self, desc: u64) -> Option<String> {
+        if desc == 0 {
+            return Some("invalid".to_string());
+        }
+        if desc & 0b10 == 0 {
+            return None;
+        }
+
+        let oa_mask: u64 = ((1 << 36) - 1) << 12;
+        let page_name = self.page_names.get(&(desc & oa_mask))?;
+
+        let (fields, (default_bits, _)) = if self.region == "stage 2" {
+            (S2PageAttrs::fields(), S2PageAttrs::default().bits())
+        } else {
+            (S1PageAttrs::fields(), S1PageAttrs::default().bits())
+        };
+
+        let mut known_mask: u64 = 0b10 | oa_mask;
+        let mut with_fields = Vec::new();
+        for &(field, hi, lo) in fields {
+            let mask = bzhi_u64(u64::MAX, ((hi - lo) + 1) as u32) << lo;
+            known_mask |= mask;
+            let actual = (desc & mask) >> lo;
+            if actual != (default_bits & mask) >> lo {
+                with_fields.push(format!("{} = 0b{:b}", field, actual));
+            }
+        }
+
+        if desc & !known_mask != 0 {
+            return None;
+        }
+
+        if with_fields.is_empty() {
+            Some(page_name.clone())
+        } else {
+            Some(format!("{} with [{}]", page_name, with_fields.join(", ")))
+        }
+    }
+
+    /// `values` are the descriptor values this one write can take outside
+    /// the entry's declared set. `complete` says whether the enumeration
+    /// found all such values of this write, or gave up early (cap, unknown
+    /// solver result, unparseable model). It says nothing about other
+    /// writes in the test: execution stops at the first offending write.
+    fn undeclared_write_error(&self, addr: u64, values: &[u64], complete: bool) -> ExecError {
+        let (lhs, location) = match self.pte_names.get(&addr) {
+            Some(va) => (va.clone(), format!("l3pte({}) at 0x{:x}", va, addr)),
+            None => (format!("0x{:x}", addr), format!("0x{:x}", addr)),
+        };
+        let mut missing: Vec<(String, String)> = values
+            .iter()
+            .map(|v| {
+                let rhs = self.print_desc(*v).unwrap_or_else(|| format!("0x{:x}", v));
+                (format!("{} ?-> {}", lhs, rhs), format!("0x{:x}", v))
+            })
+            .collect();
+        missing.sort();
+        if !complete {
+            missing.push((format!("{} ?-> ?", lhs), "?".to_string()));
+        }
+        let value = missing.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(", ");
+        let missing = missing.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>().join("; ");
+        ExecError::PageTableWriteUndeclared { location, value, missing }
+    }
+
     fn initial_descriptor(&self, addr: u64) -> Option<u64> {
         let table_addr = addr & !0xFFF;
 
@@ -1029,38 +1140,86 @@ impl<B: BV> CustomRegion<B> for ImmutablePageTables<B> {
         let offset = ((addr & 0xFFF) >> 3) as usize;
         let i = ((table_addr - self.base_addr) >> 12) as usize;
 
-        let current_desc: Val<B> = match self.tables.get(i) {
-            Some(PageTable { table }) => table[offset].to_val(solver),
+        // the values reads of this entry can return: initial value plus
+        // ?-> alternatives
+        let declared: Vec<u64> = match self.tables.get(i) {
+            Some(PageTable { table }) => match &table[offset] {
+                Desc::Concrete(bits) => vec![*bits],
+                Desc::Symbolic(init, alternatives, _) => {
+                    let mut declared = alternatives.clone();
+                    declared.push(*init);
+                    declared
+                }
+            },
             None => return Err(ExecError::BadWrite("page table index out of bounds")),
         };
 
-        let (skip_sat_check, query) = match (current_desc, &write_desc) {
-            (Val::Bits(d1), Val::Bits(d2)) if d1 == *d2 => (true, Exp::Bool(true)),
-            (Val::Bits(d1), Val::Symbolic(d2)) => (false, Exp::Eq(Box::new(smt_sbits(d1)), Box::new(Exp::Var(*d2)))),
-            (Val::Symbolic(d1), Val::Bits(d2)) => (false, Exp::Eq(Box::new(Exp::Var(d1)), Box::new(smt_sbits(*d2)))),
-            (Val::Symbolic(d1), Val::Symbolic(d2)) => (false, Exp::Eq(Box::new(Exp::Var(d1)), Box::new(Exp::Var(*d2)))),
-            (Val::Bits(_), Val::Bits(_)) => {
-                return Err(ExecError::BadWrite("page table write trivially unsatisfiable"))
+        // a write outside the declared set can never be observed by a read,
+        // so the executions containing it would be silently missing; error
+        // instead
+        match &write_desc {
+            Val::Bits(bits) => {
+                if !declared.contains(&bits.lower_u64()) {
+                    return Err(self.undeclared_write_error(addr, &[bits.lower_u64()], true));
+                }
             }
-            (_, _) => return Err(ExecError::BadWrite("ill-typed descriptor")),
-        };
-
-        if skip_sat_check || solver.check_sat_with(&query, SourceLoc::unknown()) == SmtResult::Sat {
-            let value = solver.declare_const(Ty::Bool, SourceLoc::unknown());
-            solver.add_event(Event::WriteMem {
-                value,
-                write_kind,
-                address: Val::Bits(B::from_u64(addr)),
-                data: write_desc,
-                bytes: 8,
-                tag_value: tag,
-                opts: WriteOpts::default(),
-                region: self.region,
-            });
-            Ok(Val::Symbolic(value))
-        } else {
-            Err(ExecError::BadWrite("page table write unsatisfiable"))
+            Val::Symbolic(v) => {
+                let member = declared
+                    .iter()
+                    .map(|bits| Exp::Eq(Box::new(Exp::Var(*v)), Box::new(bits64(*bits, 64))))
+                    .reduce(|e1, e2| Exp::Or(Box::new(e1), Box::new(e2)))
+                    .unwrap();
+                // enumerate the values the write can take outside the
+                // declared set so the error lists every missing declaration
+                const MAX_UNDECLARED_VALUES: usize = 8;
+                let mut undeclared: Vec<u64> = Vec::new();
+                let mut complete = true;
+                loop {
+                    let mut query = Exp::Not(Box::new(member.clone()));
+                    for w in &undeclared {
+                        let differs = Exp::Neq(Box::new(Exp::Var(*v)), Box::new(bits64(*w, 64)));
+                        query = Exp::And(Box::new(query), Box::new(differs));
+                    }
+                    match solver.check_sat_with(&query, SourceLoc::unknown()) {
+                        SmtResult::Unsat => break,
+                        SmtResult::Sat => match Model::new(solver).get_var(*v) {
+                            Ok(ModelVal::Exp(Exp::Bits64(bv))) => {
+                                undeclared.push(bv.lower_u64());
+                                if undeclared.len() >= MAX_UNDECLARED_VALUES {
+                                    complete = false;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                complete = false;
+                                break;
+                            }
+                        },
+                        SmtResult::Unknown => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if !undeclared.is_empty() || !complete {
+                    return Err(self.undeclared_write_error(addr, &undeclared, complete));
+                }
+            }
+            _ => return Err(ExecError::BadWrite("ill-typed descriptor")),
         }
+
+        let value = solver.declare_const(Ty::Bool, SourceLoc::unknown());
+        solver.add_event(Event::WriteMem {
+            value,
+            write_kind,
+            address: Val::Bits(B::from_u64(addr)),
+            data: write_desc,
+            bytes: 8,
+            tag_value: tag,
+            opts: WriteOpts::default(),
+            region: self.region,
+        });
+        Ok(Val::Symbolic(value))
     }
 
     fn initial_value(&self, addr: u64, bytes: u32) -> Option<B> {

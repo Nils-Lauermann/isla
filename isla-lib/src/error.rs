@@ -86,6 +86,13 @@ pub enum ExecError {
     PCLimitReached(u64),
     InconsistentRegisterReset,
     BadInterrupt(&'static str),
+    /// Page table write outside the entry's declared descriptor set;
+    /// reads never see such values, so executions would be silently lost.
+    PageTableWriteUndeclared {
+        location: String,
+        value: String,
+        missing: String,
+    },
 }
 
 impl IslaError for ExecError {
@@ -131,6 +138,11 @@ impl fmt::Display for ExecError {
             PCLimitReached(pc_value) => write!(f, "Executed instruction at {} more than specified limit", pc_value),
             InconsistentRegisterReset => write!(f, "Inconsistent register reset constraints"),
             BadInterrupt(msg) => write!(f, "Bad task interrupt: {}", msg),
+            PageTableWriteUndeclared { location, value, missing } => write!(
+                f,
+                "Page table write of undeclared descriptor value {} to {}: missing {}",
+                value, location, missing
+            ),
         }
     }
 }

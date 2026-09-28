@@ -1371,6 +1371,23 @@ pub fn armv8_page_tables<B: BV>(
         })
         .collect();
 
+    // name pages and level 3 entries so page table write errors can suggest
+    // the missing declaration
+    {
+        let Ctx { vars, all_tables, .. } = &mut ctx;
+        for (level0, tables, stage) in all_tables.iter_mut() {
+            for (name, v) in vars.iter() {
+                match (v, &*stage) {
+                    (TVal::PA(pa), _) => tables.name_page(*pa, name),
+                    // stage 1 output addresses are intermediate physical
+                    (TVal::IPA(ipa), Stage::S1) => tables.name_page(ipa.bits(), name),
+                    (TVal::VA(va), Stage::S1) | (TVal::IPA(va), Stage::S2) => tables.name_va_l3pte(*level0, *va, name),
+                    _ => (),
+                }
+            }
+        }
+    }
+
     for (_, tables, _) in ctx.all_tables.drain(..) {
         memory.add_region(Region::Custom(tables.range(), Box::new(tables.freeze())))
     }
