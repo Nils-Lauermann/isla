@@ -900,7 +900,7 @@ fn isla_main() -> i32 {
                         } else {
                             litmus.final_assertion = original;
                             let rerun = run_litmus::smt_output_per_candidate::<B129, _, _, FinalLocValuesError>(
-                                &uid,
+                                &format!("g{}t{}", group_id, i),
                                 &opts,
                                 &litmus,
                                 &graph_opts,
@@ -914,7 +914,7 @@ fn isla_main() -> i32 {
                                 check_sat_using,
                                 get_z3_model,
                                 cache,
-                                &|_exec, _memory, _all_addrs, _tables, _footprints, z3_output, _smt_path| {
+                                &|_exec, _memory, _all_addrs, _tables, _footprints, z3_output| {
                                     if z3_output.starts_with("sat") {
                                         result_queue.push(Allowed(None, None));
                                     } else if z3_output.starts_with("unsat") {
