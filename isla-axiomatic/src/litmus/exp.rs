@@ -815,7 +815,7 @@ impl<'e, 's, 'ir, A: fmt::Display> fmt::Display for ExpDisplay<'e, 's, 'ir, A> {
                 write!(f, "{}", elems.join(" \\/ "))
             }
             Not(e) => {
-                write!(f, "{}", e.display(self.symtab, self.exp.precedence()))
+                write!(f, "~{}", e.display(self.symtab, self.exp.precedence()))
             }
             App(name, args, kwargs) => {
                 let args: Vec<String> = args
@@ -828,7 +828,7 @@ impl<'e, 's, 'ir, A: fmt::Display> fmt::Display for ExpDisplay<'e, 's, 'ir, A> {
             Implies(lhs, rhs) => {
                 write!(
                     f,
-                    "{}-->{},",
+                    "{}-->{}",
                     lhs.display(self.symtab, lhs.precedence()),
                     rhs.display(self.symtab, rhs.precedence())
                 )
