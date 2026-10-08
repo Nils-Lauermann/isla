@@ -1022,10 +1022,14 @@ impl<B: BV> ImmutablePageTables<B> {
             return None;
         }
 
+        // a bare `with [..]` applies the fields to both stages, so name the
+        // other stage's attributes explicitly
         if with_fields.is_empty() {
             Some(page_name.clone())
+        } else if self.region == "stage 2" {
+            Some(format!("{} with default and [{}]", page_name, with_fields.join(", ")))
         } else {
-            Some(format!("{} with [{}]", page_name, with_fields.join(", ")))
+            Some(format!("{} with [{}] and default", page_name, with_fields.join(", ")))
         }
     }
 
