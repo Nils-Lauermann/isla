@@ -28,7 +28,7 @@ linker = "/opt/homebrew/opt/llvm/bin/ld.lld"
 
 [[toolchain]]
 name = "default"
-assembler = "aarch64-linux-gnu-as -march=armv8.1-a"
+assembler = "aarch64-linux-gnu-as -march=armv8.3-a"
 objdump = "aarch64-linux-gnu-objdump"
 nm = "aarch64-linux-gnu-nm"
 linker = "aarch64-linux-gnu-ld"
@@ -53,7 +53,7 @@ stride = "0x1000"
 # address.
 [symbolic_addrs]
 base = "0x600000"
-top = "0x700000"
+top = "0x100000000"
 stride = "0x1000"
 
 [registers]
@@ -273,7 +273,7 @@ ignore = [
 "FEAT_FPAC_IMPLEMENTED" = false
 "FEAT_FPACCOMBINE_IMPLEMENTED" = false
 "FEAT_JSCVT_IMPLEMENTED" = false
-"FEAT_LRCPC_IMPLEMENTED" = false
+"FEAT_LRCPC_IMPLEMENTED" = true
 "FEAT_NV_IMPLEMENTED" = false
 "FEAT_PACIMP_IMPLEMENTED" = false
 "FEAT_PACQARMA3_IMPLEMENTED" = false
@@ -563,3 +563,7 @@ ignore = [
 "W28" = "R28"
 "W29" = "R29"
 "W30" = "R30"
+"TTBR0_EL1" = "_TTBR0_EL1"
+"TTBR0_EL2" = "_TTBR0_EL2"
+"TTBR1_EL1" = "_TTBR1_EL1"
+"VTTBR_EL2" = "_VTTBR_EL2"
